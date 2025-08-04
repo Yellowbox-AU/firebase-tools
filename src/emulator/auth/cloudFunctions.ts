@@ -13,18 +13,6 @@ type CreateEvent = EventContext & {
   data: UserInfoPayload;
 };
 
-// Custom EventContext type to replace the deprecated one from firebase-functions
-interface EventContext {
-  eventId: string;
-  eventType: string;
-  resource: {
-    name: string;
-    service: string;
-  };
-  params: Record<string, any>;
-  timestamp: string;
-};
-
 export class AuthCloudFunction {
   private logger = EmulatorLogger.forEmulator(Emulators.AUTH);
   private enabled = false;

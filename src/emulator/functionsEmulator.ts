@@ -186,6 +186,59 @@ interface EmulatedTriggerRecord {
   url?: string;
 }
 
+const getDocumentPath = (signature: SignatureType, eventTrigger: EventTrigger): string => {
+  if (signature === "cloudevent") {
+    // For V2: use document.value directly
+    return (
+      eventTrigger.eventFilters?.document || eventTrigger.eventFilterPathPatterns?.document || ""
+    );
+  }
+  // For V1: extract from resource
+  // resource: "projects/demo-project/databases/(default)/documents/someCollection/{docId}"
+  // extract: "someCollection/{docId}"
+  const resourceMatch = eventTrigger.resource?.match(/\/documents\/(.+)$/);
+  const path = resourceMatch ? resourceMatch[1] : "";
+
+  // The V1 path can contain wildcards in the {wildcard} format.
+  // We need to extract the name of the wildcard.
+  return path
+    .split("/")
+    .map((segment) => {
+      if (segment.startsWith("{") && segment.endsWith("}")) {
+        // Extract the wildcard name.
+        return `{${segment.slice(1, -1)}}`;
+      }
+      return segment;
+    })
+    .join("/");
+};
+
+const pathMatches = (pattern: string, path: string): [boolean, Record<string, string>] => {
+  const params: Record<string, string> = {};
+  const patternParts = pattern.split("/");
+  const pathParts = path.split("/");
+
+  if (patternParts.length !== pathParts.length) {
+    console.debug(`pathMatches: ${pattern} ${path} false`);
+    return [false, {}];
+  }
+
+  for (let i = 0; i < patternParts.length; i++) {
+    const patternPart = patternParts[i];
+    const pathPart = pathParts[i];
+    if (patternPart.startsWith("{") && patternPart.endsWith("}")) {
+      const wildcardName = patternPart.slice(1, -1);
+      params[wildcardName] = pathPart;
+    } else if (patternPart !== pathPart) {
+      console.debug(`pathMatches: ${pattern} ${path} false`);
+      return [false, {}];
+    }
+  }
+
+  console.debug(`pathMatches: ${pattern} ${path} true`);
+  return [true, params];
+};
+
 export class FunctionsEmulator implements EmulatorInstance {
   static getHttpFunctionUrl(
     projectId: string,
@@ -309,6 +362,8 @@ export class FunctionsEmulator implements EmulatorInstance {
         chunks.push(chunk);
       });
       req.on("end", () => {
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore
         (req as RequestWithRawBody).rawBody = Buffer.concat(chunks);
         next();
       });
@@ -339,199 +394,261 @@ export class FunctionsEmulator implements EmulatorInstance {
     };
 
     const makeWorkHelperV1 = (
-        host: string,
-        port: number,
-        req: express.Request,
-        projectId: string,
-        triggerId: string,
-        reqBody: any,
-      ): Work => {
-        const work: Work = () => {
-          return new Promise<void>((resolve, reject) => {
-            const trigReq = http.request({
-              host: connectableHostname(host),
-              port,
-              method: req.method,
-              path: `/functions/projects/${projectId}/triggers/${triggerId}`,
-              headers: req.headers,
-            });
+      host: string,
+      port: number,
+      req: express.Request,
+      projectId: string,
+      triggerId: string,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      rawBody: any,
+      reqBody: any,
+    ): Work => {
+      const work: Work = () => {
+        return new Promise<void>((resolve, reject) => {
+          const body = Buffer.from(JSON.stringify(reqBody));
+          const headers = { ...req.headers };
+          headers["content-length"] = `${body.length}`;
 
-            trigReq.on("error", reject);
-            trigReq.write(reqBody);
-            trigReq.end();
-            resolve();
+          const trigReq = http.request({
+            host: connectableHostname(host),
+            port,
+            method: req.method,
+            path: `/functions/projects/${projectId}/triggers/${triggerId}`,
+            headers: headers,
           });
-        };
-        work.type = `${triggerId}-${new Date().toISOString()}`;
-        return work;
+
+          trigReq.on("error", reject);
+          trigReq.write(body);
+          trigReq.end();
+          resolve();
+        });
       };
-  
-      const makeWorkHelperV2 = (
-        host: string,
-        port: number,
-        req: express.Request,
-        projectId: string,
-        triggerId: string,
-        reqBody: any,
-      ): Work => {
-        const work: Work = () => {
-          return new Promise<void>((resolve, reject) => {
-            let headers = { ...req.headers };
-  
-            try {
-              const originalEvent = reqBody;
-  
-              let eventType;
-              if (
-                originalEvent.context.eventType ===
-                "providers/selfhosted.firestore/eventTypes/document.create"
-              ) {
-                eventType = "google.cloud.firestore.document.v1.created";
-              } else if (
-                originalEvent.context.eventType ===
-                "providers/selfhosted.firestore/eventTypes/document.update"
-              ) {
-                eventType = "google.cloud.firestore.document.v1.updated";
-              } else if (
-                originalEvent.context.eventType ===
-                "providers/selfhosted.firestore/eventTypes/document.delete"
-              ) {
-                eventType = "google.cloud.firestore.document.v1.deleted";
-              }
-  
-              // Create CloudEvent format
-              const cloudEvent = {
-                specversion: "1.0",
-                type: eventType,
-                source: "projects/_/databases/(default)",
-                id: originalEvent.context.eventId,
-                time: originalEvent.context.timestamp,
-                datacontenttype: "application/json",
-                document: originalEvent.context.resource.name.replace(
-                  "projects/demo-project/databases/(default)/documents/",
-                  "",
-                ),
-                data: originalEvent.data,
-              };
-  
-              const requestBody = Buffer.from(JSON.stringify(cloudEvent));
-              headers = {
-                ...headers,
-                "content-type": "application/cloudevents+json",
-                "content-length": requestBody.length.toString(),
-              };
-            } catch (error) {
-              console.error("Error converting to CloudEvent format:", error);
-              reject(error);
-              return;
-            }
-  
-            const trigReq = http.request({
-              host: connectableHostname(host),
-              port,
-              method: req.method,
-              path: `/functions/projects/${projectId}/triggers/${triggerId}`,
-              headers,
-            });
-            trigReq.on("error", reject);
-            trigReq.write(reqBody);
-            trigReq.end();
-            resolve();
-          });
-        };
-        work.type = `${triggerId}-${new Date().toISOString()}`;
+      work.type = `${triggerId}-${new Date().toISOString()}`;
       return work;
     };
-  
+
+    const makeWorkHelperV2 = (
+      host: string,
+      port: number,
+      req: express.Request,
+      projectId: string,
+      triggerId: string,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      rawBody: any,
+      reqBody: any,
+    ): Work => {
+      const work: Work = () => {
+        return new Promise<void>((resolve, reject) => {
+          let headers = { ...req.headers };
+          let requestBody;
+
+          try {
+            const originalEvent = reqBody;
+
+            let eventType;
+            if (
+              originalEvent.context.eventType ===
+              "providers/cloud.firestore/eventTypes/document.create"
+            ) {
+              eventType = "google.cloud.firestore.document.v1.created";
+            } else if (
+              originalEvent.context.eventType ===
+              "providers/cloud.firestore/eventTypes/document.update"
+            ) {
+              eventType = "google.cloud.firestore.document.v1.updated";
+            } else if (
+              originalEvent.context.eventType ===
+              "providers/cloud.firestore/eventTypes/document.delete"
+            ) {
+              eventType = "google.cloud.firestore.document.v1.deleted";
+            }
+
+            // Create CloudEvent format
+            const cloudEvent = {
+              specversion: "1.0",
+              type: eventType,
+              source: "projects/_/databases/(default)",
+              id: originalEvent.context.eventId,
+              time: originalEvent.context.timestamp,
+              datacontenttype: "application/json",
+              document: originalEvent.context.resource.name.replace(
+                "projects/demo-project/databases/(default)/documents/",
+                "",
+              ),
+              data: originalEvent.data,
+              params: originalEvent.context.params,
+            };
+
+            requestBody = Buffer.from(JSON.stringify(cloudEvent));
+            headers = {
+              ...headers,
+              "content-type": "application/cloudevents+json",
+              "content-length": requestBody.length.toString(),
+            };
+          } catch (error) {
+            console.error("Error converting to CloudEvent format:", error);
+            reject(error);
+            return;
+          }
+
+          const trigReq = http.request({
+            host: connectableHostname(host),
+            port,
+            method: req.method,
+            path: `/functions/projects/${projectId}/triggers/${triggerId}`,
+            headers,
+          });
+          trigReq.on("error", reject);
+          trigReq.write(requestBody);
+          trigReq.end();
+          resolve();
+        });
+      };
+      work.type = `${triggerId}-${new Date().toISOString()}`;
+      return work;
+    };
+
+    const isV1FirestoreEvent = (eventType: string): boolean => {
+      return eventType.startsWith("providers/cloud.firestore");
+    };
+
+    const shouldFireV1 = (triggerEventType: string, reqBodyEventType: string): boolean => {
+      if (triggerEventType === "providers/cloud.firestore/eventTypes/document.write") {
+        return (
+          reqBodyEventType === "providers/cloud.firestore/eventTypes/document.create" ||
+          reqBodyEventType === "providers/cloud.firestore/eventTypes/document.update" ||
+          reqBodyEventType === "providers/cloud.firestore/eventTypes/document.delete"
+        );
+      }
+      return false;
+    };
+
+    const isV2FirestoreEvent = (eventType: string): boolean => {
+      return eventType.startsWith("google.cloud.firestore");
+    };
+
+    const shouldFireV2 = (triggerEventType: string, reqBodyEventType: string): boolean => {
+      if (
+        triggerEventType === "google.cloud.firestore.document.v1.written" ||
+        triggerEventType === "google.cloud.firestore.document.v1.written.withAuthContext"
+      ) {
+        return (
+          reqBodyEventType === "providers/cloud.firestore/eventTypes/document.create" ||
+          reqBodyEventType === "providers/cloud.firestore/eventTypes/document.update" ||
+          reqBodyEventType === "providers/cloud.firestore/eventTypes/document.delete"
+        );
+      }
+      return false;
+    };
+
+    const isV2EventTypeMatch = (triggerEventType: string, reqBodyEventType: string): boolean => {
+      return (
+        (reqBodyEventType === "providers/cloud.firestore/eventTypes/document.create" &&
+          (triggerEventType === "google.cloud.firestore.document.v1.created" ||
+            triggerEventType === "google.cloud.firestore.document.v1.created.withAuthContext")) ||
+        (reqBodyEventType === "providers/cloud.firestore/eventTypes/document.update" &&
+          (triggerEventType === "google.cloud.firestore.document.v1.updated" ||
+            triggerEventType === "google.cloud.firestore.document.v1.updated.withAuthContext")) ||
+        (reqBodyEventType === "providers/cloud.firestore/eventTypes/document.delete" &&
+          (triggerEventType === "google.cloud.firestore.document.v1.deleted" ||
+            triggerEventType === "google.cloud.firestore.document.v1.deleted.withAuthContext"))
+      );
+    };
 
     const multicastHandler: express.RequestHandler = (req: express.Request, res) => {
       const projectId = req.params.project_id;
       const rawBody = (req as RequestWithRawBody).rawBody;
       const event = JSON.parse(rawBody.toString());
 
-      // Modified for firestoreselfhosted:
-      // - Added a branch for handling Firestore Triggered Functions
-      // - The else branch is the same
       if (req.headers["x-firestoreselfhosted"]) {
         const reqBody = JSON.parse(rawBody.toString());
-        // projects/demo-project/databases/(default)/documents/someCollection/{docId}
+
+        // TODO: remove me, for debugging
+        if (reqBody.data.value.name.includes("testLogsCollection")) {
+          res.json({ status: "multicast_acknowledged" });
+          return;
+        }
+
         const triggerKey = reqBody.context.resource.name;
         const firestorePath = triggerKey.split(
           "projects/demo-project/databases/(default)/documents/",
         )[1];
-        // TODO(liam@): Add support for subcollections
-        const collectionName = firestorePath.split("/")[0];
-        const eventId = collectionName;
 
-        const triggers = this.multicastTriggers[eventId] || [];
+        const triggers: { trigger: string; params: Record<string, string> }[] = [];
+        for (const pattern of Object.keys(this.multicastTriggers)) {
+          const [matches, params] = pathMatches(pattern, firestorePath);
+          if (matches) {
+            this.multicastTriggers[pattern].forEach((trigger) => {
+              triggers.push({ trigger, params });
+            });
+          }
+        }
+
         const { host, port } = this.getInfo();
 
         const reqBodyEventType = reqBody.context.eventType;
 
-        triggers.forEach((trigger) => {
+        const debugName = reqBody.data.value.name.replace(
+          "projects/demo-project/databases/(default)/documents/",
+          "",
+        );
+        console.debug(`multicastHandler ${debugName}`);
+
+        // TODO: should store triggers in a more structured way to find efficiently
+        // Or completely remove the multicast handler and have firestoreselfhosted do this
+        triggers.forEach(({ trigger, params }) => {
           const [triggerEventType, triggerId] = trigger.split(":");
 
-          console.log(
-            "multicastHandler trigger eventTypecompare",
-            triggerEventType,
-            reqBodyEventType,
-          );
+          const newContext = { ...reqBody.context, params };
+          const newReqBody = { ...reqBody, context: newContext };
 
           // v1
-          if (triggerEventType === "providers/cloud.firestore/eventTypes/document.write") {
-            // onWrite should trigger for create, update, or delete events
+          if (isV1FirestoreEvent(triggerEventType)) {
             if (
-              reqBodyEventType === "providers/cloud.firestore/eventTypes/document.create" ||
-              reqBodyEventType === "providers/cloud.firestore/eventTypes/document.update" ||
-              reqBodyEventType === "providers/cloud.firestore/eventTypes/document.delete"
+              shouldFireV1(triggerEventType, reqBodyEventType) ||
+              reqBodyEventType === triggerEventType
             ) {
-              console.log("multicastHandler makeWorkHelperV1", reqBodyEventType, triggerId);
-              const work = makeWorkHelperV1(host, port, req, projectId, triggerId, rawBody);
+              console.debug(`multicastHandler INVOKE ${debugName} v1 ${triggerId}`);
+              const work = makeWorkHelperV1(
+                host,
+                port,
+                req,
+                projectId,
+                triggerId,
+                rawBody,
+                newReqBody,
+              );
               this.workQueue.submit(work);
             }
-          }
-          if (reqBodyEventType === triggerEventType) {
-            console.log("multicastHandler makeWorkHelperV1", reqBodyEventType, triggerId);
-            const work = makeWorkHelperV1(host, port, req, projectId, triggerId, rawBody, reqBody);
-            this.workQueue.submit(work);
           }
 
           // v2
-          if (
-            triggerEventType === "google.cloud.firestore.document.v1.written" ||
-            triggerEventType === "google.cloud.firestore.document.v1.written.withAuthContext"
-          ) {
+          if (isV2FirestoreEvent(triggerEventType)) {
             if (
-              reqBodyEventType === "providers/cloud.firestore/eventTypes/document.create" ||
-              reqBodyEventType === "providers/cloud.firestore/eventTypes/document.update" ||
-              reqBodyEventType === "providers/cloud.firestore/eventTypes/document.delete"
+              shouldFireV2(triggerEventType, reqBodyEventType) ||
+              isV2EventTypeMatch(triggerEventType, reqBodyEventType)
             ) {
-              const work = makeWorkHelperV2(host, port, req, projectId, triggerId, rawBody);
+              console.debug(`multicastHandler INVOKE ${debugName} v2 ${triggerId}`);
+              const work = makeWorkHelperV2(
+                host,
+                port,
+                req,
+                projectId,
+                triggerId,
+                rawBody,
+                newReqBody,
+              );
               this.workQueue.submit(work);
             }
           }
-          if (
-            (reqBodyEventType === "providers/cloud.firestore/eventTypes/document.create" &&
-              (triggerEventType === "google.cloud.firestore.document.v1.created" ||
-                triggerEventType ===
-                  "google.cloud.firestore.document.v1.created.withAuthContext")) ||
-            (reqBodyEventType === "providers/cloud.firestore/eventTypes/document.update" &&
-              (triggerEventType === "google.cloud.firestore.document.v1.updated" ||
-                triggerEventType ===
-                  "google.cloud.firestore.document.v1.updated.withAuthContext")) ||
-            (reqBodyEventType === "providers/cloud.firestore/eventTypes/document.delete" &&
-              (triggerEventType === "google.cloud.firestore.document.v1.deleted" ||
-                triggerEventType === "google.cloud.firestore.document.v1.deleted.withAuthContext"))
-          ) {
-            const work = makeWorkHelperV2(host, port, req, projectId, triggerId, rawBody);
-            this.workQueue.submit(work);
-          }
         });
 
+        // TODO: As a hacky perf opt, could return if a trigger was actually invoked
+        // In which case firestore could use this to avoid sending the same trigger again
+        // Would be better for firestore to be able to pol
         res.json({ status: "multicast_acknowledged" });
         return;
       }
-
 
       let triggerKey: string;
       if (req.headers["content-type"]?.includes("cloudevent")) {
@@ -1025,6 +1142,15 @@ export class FunctionsEmulator implements EmulatorInstance {
           );
           delete this.triggers[key];
           break;
+        case Constants.SERVICE_FIRESTORE:
+          await this.removeFirestoreTrigger(
+            this.args.projectId,
+            key,
+            definition.eventTrigger as EventTrigger,
+            getSignatureType(definition),
+          );
+          delete this.triggers[key];
+          break;
         default:
           break;
       }
@@ -1357,33 +1483,32 @@ export class FunctionsEmulator implements EmulatorInstance {
 
     logger.debug(`addFirestoreTrigger`, JSON.stringify(bundle));
 
-    // Extract the document path for eventTriggerId
-    let documentPath: string;
-    if (signature === "cloudevent") {
-      // For V2: use document.value directly
-      documentPath =
-        eventTrigger.eventFilters?.document || eventTrigger.eventFilterPathPatterns?.document || "";
-    } else {
-      // For V1: extract from resource
-      // resource: "projects/demo-project/databases/(default)/documents/someCollection/{docId}"
-      // extract: "someCollection/{docId}"
-      const resourceMatch = eventTrigger.resource?.match(/\/documents\/(.+)$/);
-      documentPath = resourceMatch ? resourceMatch[1] : "";
-    }
-
-    // Just grab the collection name for now
-    // TODO(liam): Add support for subcollections
-    const collectionName = documentPath.split("/")[0];
-
-    // eventTriggerId = just the document path
-    const eventTriggerId = collectionName;
-
-    // trigger = eventType:key
+    const documentPath = getDocumentPath(signature, eventTrigger);
     const trigger = `${eventTrigger.eventType}:${key}`;
 
-    const triggers = this.multicastTriggers[eventTriggerId] || [];
+    const triggers = this.multicastTriggers[documentPath] || [];
     triggers.push(trigger);
-    this.multicastTriggers[eventTriggerId] = triggers;
+    this.multicastTriggers[documentPath] = triggers;
+
+    return true;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async removeFirestoreTrigger(
+    projectId: string,
+    key: string,
+    eventTrigger: EventTrigger,
+    signature: SignatureType,
+  ): Promise<boolean> {
+    const documentPath = getDocumentPath(signature, eventTrigger);
+    const trigger = `${eventTrigger.eventType}:${key}`;
+
+    const triggers = this.multicastTriggers[documentPath] || [];
+    const index = triggers.indexOf(trigger);
+    if (index > -1) {
+      triggers.splice(index, 1);
+    }
+    this.multicastTriggers[documentPath] = triggers;
 
     return true;
   }
